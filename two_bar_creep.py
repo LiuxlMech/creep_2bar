@@ -8,7 +8,7 @@ Model:
 
 Usage examples:
     python3 two_bar_creep.py --hours 500
-    python3 two_bar_creep.py --hours 500 --dt 0.1 --model norton --K 3.7e-11 --n 3
+    python3 two_bar_creep.py --hours 500 --dt 0.1 --K 3.7e-11 --n 3
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Tuple
+from typing import List, Tuple
 
 
-# (Temperature °C, alpha 1/°C)
+# (Temperature °C, mean alpha from 20°C to T, unit 1/°C)
 ALPHA_DATA: List[Tuple[float, float]] = [
     (204.0, 1.31e-5),
     (316.0, 1.35e-5),
@@ -61,7 +61,8 @@ def linear_interp(x: float, table: List[Tuple[float, float]]) -> float:
     raise RuntimeError("Interpolation failed unexpectedly.")
 
 
-def alpha_at(temp_c: float) -> float:
+def alpha_mean_from_20_at(temp_c: float) -> float:
+    """Mean thermal expansion coefficient from 20°C to temp_c."""
     return linear_interp(temp_c, ALPHA_DATA)
 
 
@@ -69,23 +70,31 @@ def E_at(temp_c: float) -> float:
     return linear_interp(temp_c, E_DATA)
 
 
-def integrate_alpha(T0_c: float, T1_c: float, n_steps: int = 2000) -> float:
-    """Integrate alpha(T)dT using trapezoidal rule."""
-    if T1_c == T0_c:
-        return 0.0
-    sign = 1.0
-    a, b = T0_c, T1_c
-    if b < a:
-        sign = -1.0
-        a, b = b, a
+def _build_cumulative_thermal_strain_table() -> List[Tuple[float, float]]:
+    """Build (T, eps_th_from_20_to_T) from mean-alpha data."""
+    table: List[Tuple[float, float]] = [(20.0, 0.0)]
+    for t, alpha_mean in ALPHA_DATA:
+        eps = alpha_mean * (t - 20.0)
+        table.append((t, eps))
+    return table
 
-    h = (b - a) / n_steps
-    total = 0.0
-    for i in range(n_steps + 1):
-        T = a + i * h
-        w = 0.5 if i == 0 or i == n_steps else 1.0
-        total += w * alpha_at(T)
-    return sign * total * h
+
+EPS_FROM_20_TABLE = _build_cumulative_thermal_strain_table()
+
+
+def thermal_strain_from_20(temp_c: float) -> float:
+    """Thermal strain from 20°C to temp_c, reconstructed from mean-alpha table."""
+    if temp_c <= 20.0:
+        return 0.0
+    # For 20~204°C, use alpha_mean(20->204) as constant mean slope near the lower bound.
+    if temp_c <= 204.0:
+        return ALPHA_DATA[0][1] * (temp_c - 20.0)
+    return linear_interp(temp_c, EPS_FROM_20_TABLE)
+
+
+def thermal_strain_between(T0_c: float, T1_c: float) -> float:
+    """Thermal strain between two temperatures using mean-alpha interpretation."""
+    return thermal_strain_from_20(T1_c) - thermal_strain_from_20(T0_c)
 
 
 @dataclass
@@ -120,7 +129,7 @@ class TwoBarCreepSolver:
         self.cfg = cfg
         self.E_a = E_at(cfg.T_a_c)
         self.E_b = E_at(cfg.T_b_c)
-        self.eps_th_b = integrate_alpha(cfg.T_a_c, cfg.T_b_c)
+        self.eps_th_b = thermal_strain_between(cfg.T_a_c, cfg.T_b_c)
         self.C = 1.0 / (1.0 / self.E_a + 1.0 / self.E_b)
 
     def sigma_b(self, eps_creep_b: float) -> float:
