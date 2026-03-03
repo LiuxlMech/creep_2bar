@@ -7,8 +7,8 @@ Model:
 - Equal axial strain due to rigid connection, zero resultant force at connection.
 
 Usage examples:
-    python3 two_bar_creep.py --hours 500
-    python3 two_bar_creep.py --hours 500 --dt 0.1 --K 3.7e-11 --n 3
+    python3 two_bar_creep.py --hours 500 --k 2
+    python3 two_bar_creep.py --hours 500 --k 2 --dt 0.1 --K 3.7e-11 --n 3
 """
 
 from __future__ import annotations
@@ -110,6 +110,7 @@ class SimConfig:
     hours: float = 500.0
     dt_h: float = 0.01
     epsilon_creep0: float = 0.0
+    k_area_ratio: float = 2.0  # k = A_A / A_B
     norton: NortonParams = field(default_factory=NortonParams)
 
 
@@ -122,6 +123,7 @@ class SimResult:
     eps_th_b: float
     E_a_mpa: float
     E_b_mpa: float
+    k_area_ratio: float
 
 
 class TwoBarCreepSolver:
@@ -130,7 +132,11 @@ class TwoBarCreepSolver:
         self.E_a = E_at(cfg.T_a_c)
         self.E_b = E_at(cfg.T_b_c)
         self.eps_th_b = thermal_strain_between(cfg.T_a_c, cfg.T_b_c)
-        self.C = 1.0 / (1.0 / self.E_a + 1.0 / self.E_b)
+        if cfg.k_area_ratio <= 0:
+            raise ValueError("k_area_ratio must be > 0")
+        # Force equilibrium: sigma_A * A_A + sigma_B * A_B = 0, k = A_A/A_B.
+        # Compatibility gives sigma_B = - (eps_th + eps_creep) / (1/(k*E_A) + 1/E_B).
+        self.C = 1.0 / (1.0 / (cfg.k_area_ratio * self.E_a) + 1.0 / self.E_b)
 
     def sigma_b(self, eps_creep_b: float) -> float:
         # Compression in B is negative.
@@ -151,7 +157,7 @@ class TwoBarCreepSolver:
         time_h = [t]
         eps_creep = [eps_c]
         sigma_b = [self.sigma_b(eps_c)]
-        sigma_a = [-sigma_b[0]]
+        sigma_a = [-sigma_b[0] / self.cfg.k_area_ratio]
 
         # RK4 integration for better stability than forward Euler.
         for _ in range(n):
@@ -169,7 +175,7 @@ class TwoBarCreepSolver:
             time_h.append(t)
             eps_creep.append(eps_c)
             sigma_b.append(sb)
-            sigma_a.append(-sb)
+            sigma_a.append(-sb / self.cfg.k_area_ratio)
 
         return SimResult(
             time_h=time_h,
@@ -179,6 +185,7 @@ class TwoBarCreepSolver:
             eps_th_b=self.eps_th_b,
             E_a_mpa=self.E_a,
             E_b_mpa=self.E_b,
+            k_area_ratio=self.cfg.k_area_ratio,
         )
 
 
@@ -187,6 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--T-a", type=float, default=20.0, help="Bar A temperature (°C)")
     p.add_argument("--T-b", type=float, default=800.0, help="Bar B temperature (°C)")
     p.add_argument("--hours", type=float, default=500.0, help="Simulation duration (h)")
+    p.add_argument("--k", type=float, default=2.0, help="Area ratio k=A_A/A_B (e.g. 2)")
     p.add_argument("--dt", type=float, default=0.01, help="Time step (h), suggest <=0.1 for stability")
     p.add_argument("--K", type=float, default=3.7e-11, help="Norton K, unit 1/(h*MPa^n)")
     p.add_argument("--n", type=float, default=3.0, help="Norton stress exponent n")
@@ -199,6 +207,7 @@ def main() -> None:
         T_a_c=args.T_a,
         T_b_c=args.T_b,
         hours=args.hours,
+        k_area_ratio=args.k,
         dt_h=args.dt,
         norton=NortonParams(K=args.K, n=args.n),
     )
@@ -207,6 +216,7 @@ def main() -> None:
     print("=== Two-Bar Creep Result ===")
     print(f"E_A = {result.E_a_mpa:.2f} MPa")
     print(f"E_B = {result.E_b_mpa:.2f} MPa")
+    print(f"k = A_A/A_B = {result.k_area_ratio:.6f}")
     print(f"eps_th_B = {result.eps_th_b:.6e}")
     print(f"sigma_B(0) = {result.sigma_b_mpa[0]:.3f} MPa")
     print(f"sigma_B({args.hours:g} h) = {result.sigma_b_mpa[-1]:.3f} MPa")

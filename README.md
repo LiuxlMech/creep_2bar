@@ -1,6 +1,6 @@
 # creep_2bar
 
-两杆模型（A 常温弹性杆 + B 高温蠕变杆）热应力-蠕变耦合计算示例。
+两杆模型（A 常温弹性杆 + B 高温蠕变杆）热应力-蠕变耦合计算示例，支持截面积比 k=A_A/A_B。
 
 ## 文件
 
@@ -10,5 +10,5 @@
 ## 快速开始
 
 ```bash
-python3 two_bar_creep.py --hours 500
+python3 two_bar_creep.py --hours 500 --k 2
 ```
