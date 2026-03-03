@@ -8,15 +8,18 @@ Model:
 
 Usage examples:
     python3 two_bar_creep.py --hours 500 --k 2
-    python3 two_bar_creep.py --hours 500 --k 2 --dt 0.1 --K 3.7e-11 --n 3
+    python3 two_bar_creep.py --hours 500 --k 2 --creep-model creep_models/garofalo.py
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import math
-from dataclasses import dataclass, field
-from typing import List, Tuple
+from pathlib import Path
+from dataclasses import dataclass
+from types import ModuleType
+from typing import Callable, Dict, List, Tuple
 
 
 # (Temperature °C, mean alpha from 20°C to T, unit 1/°C)
@@ -97,10 +100,15 @@ def thermal_strain_between(T0_c: float, T1_c: float) -> float:
     return thermal_strain_from_20(T1_c) - thermal_strain_from_20(T0_c)
 
 
+RateFunc = Callable[..., float]
+
+
 @dataclass
-class NortonParams:
-    K: float = 3.7e-11  # 1/(h*MPa^n)
-    n: float = 3.0
+class CreepModel:
+    name: str
+    params: Dict[str, float]
+    rate_func: RateFunc
+    source_path: str
 
 
 @dataclass
@@ -111,7 +119,7 @@ class SimConfig:
     dt_h: float = 0.01
     epsilon_creep0: float = 0.0
     k_area_ratio: float = 2.0  # k = A_A / A_B
-    norton: NortonParams = field(default_factory=NortonParams)
+    creep_model_path: str = "creep_models/norton.py"
 
 
 @dataclass
@@ -124,6 +132,39 @@ class SimResult:
     E_a_mpa: float
     E_b_mpa: float
     k_area_ratio: float
+    creep_model_name: str
+    creep_model_path: str
+    creep_model_params: Dict[str, float]
+
+
+def _load_python_module(path: Path) -> ModuleType:
+    module_name = f"creep_model_{path.stem}_{abs(hash(path.resolve()))}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"Failed to load creep model file: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_creep_model(path_str: str) -> CreepModel:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        raise FileNotFoundError(f"Creep model file not found: {path}")
+    mod = _load_python_module(path)
+    rate_func = getattr(mod, "creep_rate", None)
+    if not callable(rate_func):
+        raise ValueError(f"{path} must define callable `creep_rate(...)`")
+    raw_params = getattr(mod, "PARAMS", {})
+    if raw_params is None:
+        raw_params = {}
+    if not isinstance(raw_params, dict):
+        raise ValueError(f"{path} field `PARAMS` must be a dict")
+    name = str(getattr(mod, "MODEL_NAME", path.stem))
+    params: Dict[str, float] = {str(k): float(v) for k, v in raw_params.items()}
+    return CreepModel(name=name, params=params, rate_func=rate_func, source_path=str(path))
 
 
 class TwoBarCreepSolver:
@@ -132,6 +173,7 @@ class TwoBarCreepSolver:
         self.E_a = E_at(cfg.T_a_c)
         self.E_b = E_at(cfg.T_b_c)
         self.eps_th_b = thermal_strain_between(cfg.T_a_c, cfg.T_b_c)
+        self.creep_model = load_creep_model(cfg.creep_model_path)
         if cfg.k_area_ratio <= 0:
             raise ValueError("k_area_ratio must be > 0")
         # Force equilibrium: sigma_A * A_A + sigma_B * A_B = 0, k = A_A/A_B.
@@ -142,12 +184,23 @@ class TwoBarCreepSolver:
         # Compression in B is negative.
         return -self.C * (eps_creep_b + self.eps_th_b)
 
-    def creep_rate(self, eps_creep_b: float) -> float:
+    def creep_rate(self, eps_creep_b: float, t_h: float) -> float:
         sigma = self.sigma_b(eps_creep_b)
-        p = self.cfg.norton
-        # Generic odd/even n compatible form: eps_dot = K * sigma * |sigma|^(n-1).
-        # Compression (sigma<0) gives negative creep strain; tension gives positive.
-        return p.K * sigma * (abs(sigma) ** (p.n - 1.0))
+        try:
+            value = self.creep_model.rate_func(
+                sigma_mpa=sigma,
+                eps_creep=eps_creep_b,
+                t_h=t_h,
+                temp_c=self.cfg.T_b_c,
+                params=self.creep_model.params,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Error in creep model '{self.creep_model.name}' ({self.creep_model.source_path})"
+            ) from exc
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise ValueError("creep_rate(...) must return a finite float")
+        return float(value)
 
     def solve(self) -> SimResult:
         n = int(round(self.cfg.hours / self.cfg.dt_h))
@@ -163,10 +216,10 @@ class TwoBarCreepSolver:
         for _ in range(n):
             dt = self.cfg.dt_h
 
-            k1 = self.creep_rate(eps_c)
-            k2 = self.creep_rate(eps_c + 0.5 * dt * k1)
-            k3 = self.creep_rate(eps_c + 0.5 * dt * k2)
-            k4 = self.creep_rate(eps_c + dt * k3)
+            k1 = self.creep_rate(eps_c, t)
+            k2 = self.creep_rate(eps_c + 0.5 * dt * k1, t + 0.5 * dt)
+            k3 = self.creep_rate(eps_c + 0.5 * dt * k2, t + 0.5 * dt)
+            k4 = self.creep_rate(eps_c + dt * k3, t + dt)
             eps_c = eps_c + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
             t += dt
@@ -186,6 +239,9 @@ class TwoBarCreepSolver:
             E_a_mpa=self.E_a,
             E_b_mpa=self.E_b,
             k_area_ratio=self.cfg.k_area_ratio,
+            creep_model_name=self.creep_model.name,
+            creep_model_path=self.creep_model.source_path,
+            creep_model_params=self.creep_model.params,
         )
 
 
@@ -196,8 +252,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hours", type=float, default=500.0, help="Simulation duration (h)")
     p.add_argument("--k", type=float, default=2.0, help="Area ratio k=A_A/A_B (e.g. 2)")
     p.add_argument("--dt", type=float, default=0.01, help="Time step (h), suggest <=0.1 for stability")
-    p.add_argument("--K", type=float, default=3.7e-11, help="Norton K, unit 1/(h*MPa^n)")
-    p.add_argument("--n", type=float, default=3.0, help="Norton stress exponent n")
+    p.add_argument(
+        "--creep-model",
+        type=str,
+        default="creep_models/norton.py",
+        help="Path to creep model file (.py) defining creep_rate(...) and PARAMS",
+    )
     return p
 
 
@@ -209,7 +269,7 @@ def main() -> None:
         hours=args.hours,
         k_area_ratio=args.k,
         dt_h=args.dt,
-        norton=NortonParams(K=args.K, n=args.n),
+        creep_model_path=args.creep_model,
     )
     result = TwoBarCreepSolver(cfg).solve()
 
@@ -217,6 +277,10 @@ def main() -> None:
     print(f"E_A = {result.E_a_mpa:.2f} MPa")
     print(f"E_B = {result.E_b_mpa:.2f} MPa")
     print(f"k = A_A/A_B = {result.k_area_ratio:.6f}")
+    print(f"creep_model = {result.creep_model_name}")
+    print(f"creep_model_file = {result.creep_model_path}")
+    if result.creep_model_params:
+        print(f"creep_model_params = {result.creep_model_params}")
     print(f"eps_th_B = {result.eps_th_b:.6e}")
     print(f"sigma_B(0) = {result.sigma_b_mpa[0]:.3f} MPa")
     print(f"sigma_B({args.hours:g} h) = {result.sigma_b_mpa[-1]:.3f} MPa")
