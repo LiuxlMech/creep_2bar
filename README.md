@@ -70,6 +70,13 @@ def creep_rate(*, sigma_mpa: float, eps_creep: float, t_h: float, temp_c: float,
 - `creep_models/garofalo.py`
 - `creep_models/custom_template.py`（自定义模板）
 
+默认 `creep_models/norton.py` 已改为温度相关 `K(T), n(T)`，采用 Inconel 625 的公开蠕变数据（650/900/980°C）进行拟合插值：
+
+- 参考：Ozgowicz et al., *Materials* 2023, 16, 7724（Table 3 与文中 `n=10.8` 说明）  
+  https://www.mdpi.com/1996-1944/16/24/7724
+- `K(T)` 在对数空间线性插值，`n(T)` 线性插值
+- 文献数据应力范围约 20-400 MPa，模型中对 `|sigma|` 做同范围钳制，减少超范围外推失真
+
 ## 4. 运行方法
 
 ### 4.1 默认示例（Norton, 500h）
