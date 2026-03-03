@@ -164,7 +164,7 @@ def load_creep_model(path_str: str) -> CreepModel:
         raise ValueError(f"{path} field `PARAMS` must be a dict")
     name = str(getattr(mod, "MODEL_NAME", path.stem))
     params: Dict[str, float] = {str(k): float(v) for k, v in raw_params.items()}
-    return CreepModel(name=name, params=params, rate_func=rate_func, source_path=str(path))
+    return CreepModel(name=name, params=params, rate_func=rate_func, source_path=str(path))  # type: ignore[arg-type]
 
 
 class TwoBarCreepSolver:
